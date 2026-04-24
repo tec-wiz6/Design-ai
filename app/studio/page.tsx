@@ -1,33 +1,98 @@
 "use client";
-import { useState, useRef } from "react";
+import { useState, useRef, useCallback } from "react";
 import Link from "next/link";
-import PromptBar from "@/components/PromptBar";
+import ChatPanel, { type ChatMessage, type GenerateOptions } from "@/components/ChatPanel";
+import FilesPanel, { type GeneratedFile } from "@/components/FilesPanel";
 import CanvasFrame from "@/components/CanvasFrame";
-import ProviderBar from "@/components/ProviderBar";
-import ExportPanel from "@/components/ExportPanel";
 import type { ProviderMode } from "@/lib/types";
 
+const PROVIDERS: { id: ProviderMode; label: string; color: string }[] = [
+  { id: "auto",       label: "Auto",       color: "#cef044" },
+  { id: "mistral",    label: "Mistral",    color: "#a78bfa" },
+  { id: "openrouter", label: "OpenRouter", color: "#38bdf8" },
+];
+
+const STEP_LABELS = [
+  "Reading brief…", "Fetching imagery…", "Selecting model…",
+  "Writing HTML…", "Writing CSS…", "Writing JS…",
+  "Splitting files…", "Rendering preview…",
+];
+
+const INITIAL_MESSAGES: ChatMessage[] = [
+  {
+    id: "welcome",
+    role: "system",
+    content: "Hey! Tell me what you want to build — a landing page, dashboard, app UI, anything. I'll ask a couple of quick questions if I need more detail, then generate the full code split across HTML, CSS, and JS files.",
+  },
+];
+
 export default function StudioPage() {
-  const [html, setHtml]               = useState("");
+  const [messages, setMessages]       = useState<ChatMessage[]>(INITIAL_MESSAGES);
+  const [files, setFiles]             = useState<GeneratedFile[]>([]);
+  const [activeFile, setActiveFile]   = useState("index.html");
   const [isGenerating, setGenerating] = useState(false);
   const [loadingStep, setStep]        = useState(0);
   const [provider, setProvider]       = useState<ProviderMode>("auto");
   const [modelUsed, setModelUsed]     = useState("");
-  const [showExport, setShowExport]   = useState(false);
   const [toast, setToast]             = useState("");
-  const stepInterval                  = useRef<ReturnType<typeof setInterval> | null>(null);
+  const stepRef                       = useRef<ReturnType<typeof setInterval> | null>(null);
 
   function showToast(msg: string) {
     setToast(msg);
-    setTimeout(() => setToast(""), 2800);
+    setTimeout(() => setToast(""), 3000);
   }
 
-  async function handleGenerate(opts: {
-    goal: string; tone: string; sections: string[];
-    imageryKeywords: string[]; isRefinement: boolean; refinementNote?: string;
-  }) {
-    setGenerating(true); setStep(0);
-    stepInterval.current = setInterval(() => setStep(s => s + 1), 900);
+  function addMessage(msg: ChatMessage) {
+    setMessages(prev => [...prev, msg]);
+  }
+
+  function updateLastSteps(steps: ChatMessage["steps"]) {
+    setMessages(prev => {
+      const copy = [...prev];
+      const last = copy[copy.length - 1];
+      if (last && last.role === "assistant") {
+        copy[copy.length - 1] = { ...last, steps };
+      }
+      return copy;
+    });
+  }
+
+  const handleGenerate = useCallback(async (opts: GenerateOptions) => {
+    setGenerating(true);
+    setStep(0);
+
+    // Add assistant message with pending steps
+    const stepsInit = STEP_LABELS.map((label, i) => ({
+      label,
+      status: i === 0 ? "active" as const : "pending" as const,
+    }));
+
+    const assistantMsgId = Date.now().toString();
+    addMessage({
+      id: assistantMsgId,
+      role: "assistant",
+      content: `Generating your design now.`,
+      steps: stepsInit,
+    });
+
+    // Animate steps
+    let stepIdx = 0;
+    stepRef.current = setInterval(() => {
+      stepIdx++;
+      setStep(stepIdx);
+      setMessages(prev => {
+        const copy = [...prev];
+        const last = copy[copy.length - 1];
+        if (last?.id === assistantMsgId && last.steps) {
+          const newSteps = last.steps.map((s, i) => ({
+            ...s,
+            status: i < stepIdx ? "done" as const : i === stepIdx ? "active" as const : "pending" as const,
+          }));
+          copy[copy.length - 1] = { ...last, steps: newSteps };
+        }
+        return copy;
+      });
+    }, 1200);
 
     try {
       const res = await fetch("/api/design", {
@@ -38,73 +103,132 @@ export default function StudioPage() {
           providerMode: provider,
           brief: {
             goal: opts.goal,
-            tone: opts.tone,
-            sections: opts.sections,
+            tone: opts.tone as never,
+            sections: opts.sections as never,
             imageryKeywords: opts.imageryKeywords,
             wantsPreview: true,
-            ...(opts.isRefinement && { existingHtml: html, refinementNote: opts.refinementNote }),
           },
         }),
       });
+
       const data = await res.json();
-      if (data.error) { showToast(`Error: ${data.error}`); return; }
-      setHtml(data.previewHtml ?? "");
+      if (data.error) {
+        addMessage({ id: Date.now().toString(), role: "system", content: `Error: ${data.error}` });
+        return;
+      }
+
+      const newFiles: GeneratedFile[] = data.files ?? [];
+      setFiles(newFiles);
+      setActiveFile(newFiles[0]?.name ?? "index.html");
       setModelUsed(data.modelUsed ?? "");
-      showToast(`Generated with ${data.modelUsed}`);
-    } catch (e) {
-      showToast("Network error — check console");
+
+      // Mark all steps done
+      setMessages(prev => {
+        const copy = [...prev];
+        const last = copy[copy.length - 1];
+        if (last?.id === assistantMsgId && last.steps) {
+          copy[copy.length - 1] = {
+            ...last,
+            steps: last.steps.map(s => ({ ...s, status: "done" as const })),
+            content: `Done! Generated ${newFiles.length} file${newFiles.length !== 1 ? "s" : ""} via ${data.modelUsed}. You can preview on the right, click any file to view its code, and download individually or as a ZIP. Want to change anything?`,
+          };
+        }
+        return copy;
+      });
+
+    } catch {
+      addMessage({ id: Date.now().toString(), role: "system", content: "Network error — check your connection." });
     } finally {
-      if (stepInterval.current) clearInterval(stepInterval.current);
+      if (stepRef.current) clearInterval(stepRef.current);
       setGenerating(false);
     }
+  }, [provider]);
+
+  function handleChipSelect(group: string, value: string) {
+    // When user clicks a chip option, treat it as a message
+    // The chat panel will handle it
+    showToast(`${group}: ${value} selected`);
   }
 
   return (
-    <div className="h-screen flex flex-col bg-bg text-text overflow-hidden">
+    <div style={{ height: "100vh", display: "flex", flexDirection: "column", background: "#090909", color: "#e8e8e8", overflow: "hidden", fontFamily: "var(--font-dm-mono)" }}>
+
       {/* Topbar */}
-      <header className="h-12 flex-shrink-0 flex items-center px-4 gap-4 border-b border-border bg-surface">
-        <Link href="/" className="flex items-center gap-2 group">
-          <span className="w-6 h-6 rounded-md bg-lime flex items-center justify-center text-bg text-xs font-bold">P</span>
-          <span className="text-sm font-semibold group-hover:text-lime transition-colors">Pixie</span>
+      <header style={{ height: 42, flexShrink: 0, display: "flex", alignItems: "center", padding: "0 14px", gap: 10, borderBottom: "1px solid #1c1c1c", background: "#111" }}>
+        <Link href="/" style={{ display: "flex", alignItems: "center", gap: 7, textDecoration: "none" }}>
+          <div style={{ width: 22, height: 22, background: "#cef044", borderRadius: 5, display: "flex", alignItems: "center", justifyContent: "center", color: "#090909", fontSize: 10, fontWeight: 900, fontFamily: "var(--font-clash)" }}>P</div>
+          <span style={{ fontSize: 13, fontWeight: 700, color: "#e8e8e8", fontFamily: "var(--font-clash)" }}>Pixie</span>
         </Link>
-        <div className="w-px h-5 bg-border" />
-        <ProviderBar value={provider} onChange={setProvider} />
-        <div className="ml-auto flex items-center gap-2">
-          {modelUsed && (
-            <span className="text-[10px] font-mono text-muted px-2 py-1 bg-s2 rounded border border-border">
-              {modelUsed}
-            </span>
-          )}
-          {html && (
-            <button
-              onClick={() => setShowExport(true)}
-              className="px-3 py-1.5 bg-lime text-bg text-xs font-bold rounded-lg hover:bg-lime/90 transition-colors"
-            >
-              ↗ Export
-            </button>
-          )}
+        <div style={{ width: 1, height: 18, background: "#1c1c1c" }} />
+
+        {/* Provider selector */}
+        <div style={{ display: "flex", gap: 3, background: "#161616", borderRadius: 6, padding: 3, border: "1px solid #1c1c1c" }}>
+          {PROVIDERS.map(p => (
+            <button key={p.id} onClick={() => setProvider(p.id)}
+              style={{
+                padding: "3px 9px", borderRadius: 4, fontSize: 9, cursor: "pointer",
+                background: provider === p.id ? `${p.color}15` : "transparent",
+                color: provider === p.id ? p.color : "#444",
+                border: provider === p.id ? `1px solid ${p.color}35` : "1px solid transparent",
+                fontFamily: "var(--font-dm-mono)", transition: "all .15s",
+              }}
+            >{p.label}</button>
+          ))}
         </div>
+
+        <div style={{ flex: 1 }} />
+
+        {modelUsed && (
+          <span style={{ fontSize: 9, color: "#2a2a2a", border: "1px solid #1c1c1c", padding: "3px 8px", borderRadius: 4, fontFamily: "var(--font-dm-mono)" }}>
+            via {modelUsed}
+          </span>
+        )}
       </header>
 
-      {/* Body */}
-      <div className="flex flex-1 overflow-hidden">
-        <div className="w-72 flex-shrink-0">
-          <PromptBar onGenerate={handleGenerate} isGenerating={isGenerating} hasDesign={!!html} />
+      {/* Main layout */}
+      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+        {/* Chat — 260px */}
+        <div style={{ width: 260, flexShrink: 0 }}>
+          <ChatPanel
+            messages={messages}
+            isGenerating={isGenerating}
+            onGenerate={handleGenerate}
+            onChipSelect={handleChipSelect}
+            provider={provider}
+          />
         </div>
-        <div className="flex-1 overflow-hidden">
-          <CanvasFrame html={html} isGenerating={isGenerating} loadingStep={loadingStep} />
+
+        {/* Files — 155px */}
+        <FilesPanel
+          files={files}
+          activeFile={activeFile}
+          onSelect={setActiveFile}
+        />
+
+        {/* Canvas — fills rest */}
+        <div style={{ flex: 1, overflow: "hidden" }}>
+          <CanvasFrame
+            files={files}
+            activeFile={activeFile}
+            isGenerating={isGenerating}
+            loadingStep={loadingStep}
+          />
         </div>
       </div>
 
-      {/* Export panel */}
-      {showExport && html && <ExportPanel html={html} onClose={() => setShowExport(false)} />}
-
       {/* Toast */}
       {toast && (
-        <div className="fixed bottom-5 right-5 px-4 py-2 bg-surface border border-border rounded-lg text-xs font-mono text-lime animate-fade-up z-50">
+        <div style={{
+          position: "fixed", bottom: 16, right: 16,
+          padding: "8px 14px", background: "#111", border: "1px solid #1e1e1e",
+          borderRadius: 7, fontSize: 10, fontFamily: "var(--font-dm-mono)", color: "#cef044",
+          zIndex: 50, animation: "fadeUp .25s ease-out",
+        }}>
           {toast}
         </div>
       )}
+
+      <style>{`@keyframes fadeUp { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }`}</style>
     </div>
   );
 }
